@@ -69,6 +69,7 @@ INDEX_TTL = float(os.environ.get("GITS3_INDEX_TTL", 30))
 
 REPO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.git")
 REPO_RE = re.compile(rf"/({REPO_NAME_RE.pattern})(/info/refs|/git-upload-pack|/git-receive-pack)")
+GC_RE = re.compile(rf"/({REPO_NAME_RE.pattern})/gc")
 PACKED_REFS_HEADER = b"# pack-refs with: peeled fully-peeled sorted \n"
 LOCAL_CONFIG = {
     "receive.unpackLimit": "1",      # jeder push -> pack, keine loose objects
@@ -428,6 +429,57 @@ def rollback(repo, before_refs, before_packs):
         os.remove(os.path.join(pdir, n))
     clear_locks(local)
     set_refs(local, before_refs)
+
+
+def gc(repo, etag):
+    """repack -a -d im cache, alle neuen packs hoch, alte packs aus dem bucket weg. nur unter synced(push=True).
+    unerreichbare objekte (z.b. gelöschte entwicklungsbranches) fliegen dabei raus.
+
+    reihenfolge: packs hoch, dann packed-refs per cas mit IDENTISCHEM inhalt (ändert nur den etag), erst
+    danach ls + delete. ein paralleler push einer zweiten instanz hat den alten etag: sein cas bekommt 412,
+    er rollt zurück, sein pack bleibt als waise im bucket bis zum nächsten gc. bei 412 bleiben alte packs liegen.
+    sekundengenaue etags (nextcloud) sind dieselbe grenze wie bei pushes."""
+    local = local_dir(repo)
+    pdir = os.path.join(local, "objects", "pack")
+    prefix = f"{repo}/objects/pack/"
+    _checked.discard(repo)  # repack räumt den cache um, der nächste request gleicht voll ab
+    cache_before = {n[:-5] for n in os.listdir(pdir) if n.endswith(".pack")}
+    size_before = sum(os.path.getsize(os.path.join(pdir, n + ".pack")) for n in cache_before)
+    # bare repo schreibt sonst .bitmap, das gehört nicht zum layout im bucket
+    git(local, "-c", "repack.writeBitmaps=false", "-c", "pack.writeBitmaps=false", "repack", "-a", "-d", "-q")
+    packs = sorted(n[:-5] for n in os.listdir(pdir) if n.endswith(".pack"))
+    if not packs:  # nichts erreichbar: ohne pack kein upload, alte packs bleiben im bucket
+        return f"{repo}: nichts erreichbar, nichts zu tun"
+    bucket_before = s3.ls(prefix)  # zählt, was wirklich im bucket liegt (inkl. waisen eines abgebrochenen gc)
+    stems_before = {n[:-5] for n in bucket_before if n.endswith(".pack")}
+    if len(packs) == 1 and packs == sorted(cache_before) and set(bucket_before) == {packs[0] + ".pack", packs[0] + ".idx"}:
+        return f"{repo}: nichts zu tun"  # genau ein pack, derselbe name vor und nach dem repack: kein re-upload
+    size_after = sum(os.path.getsize(os.path.join(pdir, n + ".pack")) for n in packs)
+    # komplette paare, die nach einem 412 schon oben liegen: der name ist deterministisch, also nicht nochmal hoch
+    pairs_before = {n[:-4] for n in bucket_before if n.endswith(".idx") and n[:-4] + ".pack" in bucket_before}
+    for stem in packs:  # alle packs, nicht nur das erste: repack kann mehrere übrig lassen
+        if stem in pairs_before:
+            continue
+        for ext in (".pack", ".idx"):  # idx nach pack, ls() nimmt nur komplette paare
+            with open(os.path.join(pdir, stem + ext), "rb") as f:
+                s3.put(f"{repo}/objects/pack/{stem}{ext}", f)
+    # cas mit identischem inhalt: der etag ändert sich, ein paralleler push mit altem etag bekommt 412.
+    # das passiert vor ls/delete, nicht als GET-vergleich davor (der wäre toctou)
+    refs = read(os.path.join(local, "packed-refs"))
+    try:
+        s3.put(f"{repo}/packed-refs", refs, {"If-Match": etag})
+    except S3Error as e:
+        if e.status == 412:
+            return f"{repo}: packed-refs hat sich während des gc geändert, alte packs bleiben liegen (nochmal gc)"
+        raise
+    old = [n for n in s3.ls(prefix) if not any(n.startswith(s + ".") for s in packs)]
+    old.sort(key=lambda n: not n.endswith(".idx"))  # idx zuerst: ohne idx ist ein pack unsichtbar
+    for n in old:
+        st, _, body = s3.req("DELETE", prefix + n)
+        if st not in (200, 204):
+            raise S3Error(f"DELETE {n} -> {st} {body[:200]!r}", st)
+    return (f"{repo}: {len(stems_before)} packs → {len(packs)}, "
+            f"{size_before / 2**20:.1f} MB → {size_after / 2**20:.1f} MB (größe aus dem cache)")
 
 
 def fix_head(repo):
@@ -800,6 +852,15 @@ class Handler(BaseHTTPRequestHandler):
                              ("Cache-Control", "no-store")])
             self.wfile.write(body)
             return
+        mg = GC_RE.fullmatch(url.path)
+        if mg:  # POST /foo.git/gc: manuell, z.b. alle paar monate. braucht rw wie ein push
+            if self.command != "POST":
+                return self.text(405, "method not allowed")
+            if not user:
+                return self.deny()
+            if role != "rw":
+                return self.text(403, f"gits3: {user} darf nur lesen")
+            return self.run_gc(mg[1])
         m = REPO_RE.fullmatch(url.path)
         if not m:
             return self.text(404, "not found")
@@ -834,6 +895,14 @@ class Handler(BaseHTTPRequestHandler):
                 with self.cgi(url, body, size, user) as (out, status, headers):
                     self.reply(status, headers)
                     shutil.copyfileobj(out, self.wfile, 1 << 16)
+
+    def run_gc(self, repo):
+        with synced(repo, push=True) as etag:  # push-lock: clones warten kurz, pushes ebenso
+            if not etag:  # kein repo im bucket, synced hat nur einen leeren cache angelegt
+                shutil.rmtree(local_dir(repo), ignore_errors=True)
+                return self.text(404, "no such repo")
+            msg = gc(repo, etag)
+        self.text(200, f"gits3: {msg}")
 
     def receive(self, repo, url, body, size, user):
         with synced(repo, push=True) as etag:

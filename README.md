@@ -120,10 +120,12 @@ git clone ./foo.git
 
 ## grenzen
 
-- **kein gc.** jeder push erzeugt ein neues pack.
+- **gc nur manuell.** jeder push erzeugt ein neues pack. `POST /foo.git/gc` (rw-login) repackt alles zu einem pack und löscht die alten aus dem bucket. unerreichbare objekte (z.b. gelöschte branches) fliegen dabei raus. der speicher bleibt im papierkorb der nextcloud, bis er leer ist.
 - **ein pack = ein PUT.** sehr große packs scheitern am upload-limit des s3-servers.
 - **cas ist nur so gut wie der etag.** sekundengenaue etags (nextcloud) können bei mehreren instanzen pushes verschlucken. eine einzelne instanz sperrt per `flock`.
 - **verwaiste packs.** scheitert das cas nach dem pack-upload, bleibt das pack ohne ref im bucket liegen.
 - **`receive.fsckObjects`.** alte repos mit fsck-macken (z.b. `zeroPaddedFilemode`) lassen sich u.u. nicht pushen.
 - **`HEAD`.** zeigt auf `main`. fehlt der branch, biegt gits3 `HEAD` beim push auf einen vorhandenen um. ändert sich `HEAD` im bucket von außen, sieht der cache das erst mit der nächsten änderung an `packed-refs`.
+- **gc und etag-granularität.** gc schreibt `packed-refs` mit identischem inhalt per cas neu, bevor es alte packs löscht. eine parallel pushende zweite instanz bekommt dann 412 und rollt zurück. sekundengenaue etags (nextcloud) können das aber übersehen, dieselbe grenze wie bei pushes.
 - **langsame leser.** ein clone sperrt das repo geteilt, ein push wartet bis zu dessen ende.
+- **gc blockiert.** gc hält den exklusiven lock. das repack großer repos dauert minuten, clones und pushes warten so lange. am reverse-proxy `proxy_read_timeout` (nginx) bzw. das timeout entsprechend hochsetzen.
