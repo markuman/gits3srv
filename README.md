@@ -45,7 +45,7 @@ git push http://localhost:8000/neu.git main   # erster angenommener push legt da
 git clone http://localhost:8000/neu.git
 ```
 
-`/` zeigt alle repos mit suche und sortierung. ein klick kopiert den clone-befehl.
+`/` zeigt alle repos mit suche und sortierung. ein klick kopiert den clone-befehl, ein klick auf `readme.md` zeigt rechts die `README.md` aus `HEAD` (roh: `GET /foo.git/readme`). markdown für arme: überschriften, fett, kursiv, links, aufzählungen. tabellen & co. bleiben quelltext.
 
 ## neues repo
 

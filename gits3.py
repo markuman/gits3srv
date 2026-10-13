@@ -16,7 +16,8 @@ zugriff:
     - lesen (clone/fetch) geht ohne login, wenn im repo die datei `git-daemon-export-ok` liegt
       (git-konvention; in der nextcloud anlegen/löschen = repo öffentlich/privat schalten),
       sonst braucht es ein login (ro oder rw). neue repos sind privat.
-    - die index-seite zeigt anonym nur öffentliche repos, /login fragt nach dem login
+    - die index-seite zeigt anonym nur öffentliche repos, /login fragt nach dem login.
+      /<repo>.git/readme liefert die README.md aus HEAD, gleiche regeln wie clone
 
 der s3-server muss conditional writes können (PUT mit If-Match / If-None-Match: *).
 aws s3 kann das seit 2024, minio, garage & co. je nach version.
@@ -66,10 +67,12 @@ LISTEN = os.environ.get("GITS3_LISTEN", "127.0.0.1:8000")
 MAX_BODY = int(os.environ.get("GITS3_MAX_BODY", 2 << 30))
 FETCH_BODY = 64 << 20  # upload-pack schickt nur wants/haves. anonym erreichbar, daher klein
 INDEX_TTL = float(os.environ.get("GITS3_INDEX_TTL", 30))
+README_MAX = 1 << 20  # größere README.md zeigt die index-seite nicht an
 
 REPO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.git")
 REPO_RE = re.compile(rf"/({REPO_NAME_RE.pattern})(/info/refs|/git-upload-pack|/git-receive-pack)")
 GC_RE = re.compile(rf"/({REPO_NAME_RE.pattern})/gc")
+README_RE = re.compile(rf"/({REPO_NAME_RE.pattern})/readme")
 PACKED_REFS_HEADER = b"# pack-refs with: peeled fully-peeled sorted \n"
 LOCAL_CONFIG = {
     "receive.unpackLimit": "1",      # jeder push -> pack, keine loose objects
@@ -528,7 +531,7 @@ def forget_index():
     _index = None
 
 
-INDEX_HTML = """<!doctype html>
+INDEX_HTML = r"""<!doctype html>
 <html lang="de">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -538,7 +541,9 @@ INDEX_HTML = """<!doctype html>
 @media (prefers-color-scheme:dark){:root{--bg:#0f0e0d;--fg:#e7e5e4;--mute:#8f8984;--line:#262321;--hover:#1a1817;--acc:#2dd4bf}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-main{max-width:40rem;margin:0 auto;padding:clamp(2rem,8vh,5rem) 1rem}
+main{max-width:84rem;margin:0 auto;padding:clamp(2rem,8vh,5rem) 1rem;display:grid;gap:3rem;align-items:start}
+@media (min-width:56rem){main{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:clamp(2rem,4vw,4rem)}
+  #p{position:sticky;top:1.5rem;max-height:calc(100vh - 3rem);overflow:auto}}
 header{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:1.25rem}
 h1{margin:0;font-size:.78rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--mute)}
 small{color:var(--mute);font-size:.8rem}
@@ -564,6 +569,13 @@ li{border-bottom:1px solid var(--line)}
 li>button{all:unset;box-sizing:border-box;width:100%;cursor:pointer;border-radius:6px;transition:background .12s}
 li>button:hover{background:var(--hover)}
 li>button:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
+li>button[aria-current]{background:var(--hover)}
+.n .rd{cursor:pointer}
+.n .rd:hover{color:var(--fg);border-color:var(--mute)}
+#c{padding-bottom:.4rem;border-bottom:1px solid var(--line);color:var(--mute);font-size:.84rem}
+pre{margin:1rem 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:.84rem/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre a{color:var(--acc);text-underline-offset:3px}
+.h1{font-size:1.6em}.h2{font-size:1.3em}.h3{font-size:1.1em}
 .n{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.93rem;overflow:hidden;text-overflow:ellipsis}
 .n span{color:var(--mute)}
 .t{color:var(--mute);font-size:.84rem;white-space:nowrap}
@@ -575,11 +587,14 @@ li>button:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
 #toast.on{opacity:1;transform:translate(-50%,0)}
 </style>
 <main>
+<div>
 <header><h1>repos</h1><small id="who"></small></header>
 <input id="q" type="search" placeholder="suchen …" autocomplete="off" spellcheck="false" autofocus>
 <div class="row head"><button data-k="name">name</button><button data-k="mtime">geändert</button></div>
 <ul id="l"></ul>
-<footer><small>klick kopiert den clone-befehl</small></footer>
+<footer><small>klick kopiert den clone-befehl · readme.md zeigt die README.md</small></footer>
+</div>
+<section id="p" hidden><div id="c" class="n"></div><pre id="r"></pre></section>
 </main>
 <div id="toast" role="status"></div>
 <script>
@@ -617,14 +632,46 @@ function item(r) {
   const li = document.createElement("li"), b = document.createElement("button");
   const n = document.createElement("span"), ext = document.createElement("span"), t = document.createElement("span");
   b.className = "row"; n.className = "n"; t.className = "t";
-  n.textContent = r.name.replace(/\\.git$/, ""); ext.textContent = ".git"; n.append(ext);
+  n.textContent = r.name.replace(/\.git$/, ""); ext.textContent = ".git"; n.append(ext);
   if (user && !r.public) { const p = document.createElement("span"); p.className = "badge"; p.textContent = "privat"; n.append(p); }
+  const rd = document.createElement("span"); rd.className = "badge rd"; rd.textContent = "readme.md"; n.append(rd);
   const d = new Date(r.mtime);
   t.textContent = isNaN(d) ? "" : ago(d); t.title = isNaN(d) ? "" : d.toLocaleString();
   b.title = cmd; b.append(n, t);
-  b.onclick = () => copy(cmd).then(() => toast("kopiert: " + cmd));
+  if (r.name === sel) b.setAttribute("aria-current", "true");
+  b.onclick = e => {
+    if (e.target !== rd) return copy(cmd).then(() => toast("kopiert: " + cmd));
+    list.querySelector("[aria-current]")?.removeAttribute("aria-current");
+    b.setAttribute("aria-current", "true");
+    show(r);
+  };
   li.append(b);
   return li;
+}
+
+// markdown für arme: überschriften, fett, kursiv, links, aufzählungen. code bleibt, wie er ist
+function md(s) {
+  const esc = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return esc.split(/(```[\s\S]*?(?:```|$)|`[^`\n]+`)/).map((t, i) => i % 2 ? t : t
+    .replace(/^(#{1,6})[ \t]+(.*)$/gm, (_, h, x) => `<b class="h${Math.min(h.length, 3)}">${x}</b>`)
+    .replace(/^([ \t]*)[-*+][ \t]/gm, "$1• ")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/\*(\S.*?)\*/g, "<i>$1</i>")
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)|https?:\/\/[^\s<)]*[^\s<).,;:]/g,
+      (m, txt, url) => `<a href="${url || m}">${txt || m}</a>`)
+  ).join("");
+}
+
+const pane = document.getElementById("p"), title = document.getElementById("c"), readme = document.getElementById("r");
+let sel;
+function show(r) {
+  sel = r.name; pane.hidden = false;
+  title.textContent = `${r.name}/README.md`;
+  if (!matchMedia("(min-width:56rem)").matches) pane.scrollIntoView({behavior: "smooth"});  // schmal: pane liegt unter der liste
+  readme.textContent = "…";
+  fetch(`/${r.name}/readme`).then(x => x.ok ? x.text() : "", () => "").then(t => {
+    if (sel === r.name) readme.innerHTML = t ? md(t) : '<span class="t">kein README.md</span>';
+  });
 }
 
 function render() {
@@ -861,6 +908,9 @@ class Handler(BaseHTTPRequestHandler):
             if role != "rw":
                 return self.text(403, f"gits3: {user} darf nur lesen")
             return self.run_gc(mg[1])
+        mr = README_RE.fullmatch(url.path)
+        if mr and self.command == "GET":  # für die index-seite, rechte hälfte
+            return self.readme(mr[1], user)
         m = REPO_RE.fullmatch(url.path)
         if not m:
             return self.text(404, "not found")
@@ -895,6 +945,28 @@ class Handler(BaseHTTPRequestHandler):
                 with self.cgi(url, body, size, user) as (out, status, headers):
                     self.reply(status, headers)
                     shutil.copyfileobj(out, self.wfile, 1 << 16)
+
+    def readme(self, repo, user):
+        """README.md aus HEAD als text/plain. gleiche regeln wie clone: anonym nur öffentliche repos."""
+        if not user and not is_public(repo):
+            return self.deny()
+        cat = lambda *a: subprocess.run(["git", "-C", local_dir(repo), "cat-file", *a, "HEAD:README.md"],
+                                        capture_output=True, env=GIT_ENV)
+        with synced(repo, push=False) as etag:
+            if etag is None:
+                return self.text(404, "no such repo")
+            size = cat("-s")  # erst die größe: kein 100-MB-"README.md" im ram
+            if size.returncode:
+                return self.text(404, "kein README.md")
+            if int(size.stdout) > README_MAX:
+                return self.text(413, f"README.md größer als {README_MAX} bytes")
+            r = cat("blob")
+        if r.returncode:  # z.b. README.md ist ein ordner
+            return self.text(404, "kein README.md")
+        self.reply(200, [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(r.stdout))),
+                         ("Cache-Control", "no-store"),  # private readmes nicht in fremde caches
+                         ("X-Content-Type-Options", "nosniff")])  # inhalt kommt vom pusher: nie als html sniffen
+        self.wfile.write(r.stdout)
 
     def run_gc(self, repo):
         with synced(repo, push=True) as etag:  # push-lock: clones warten kurz, pushes ebenso
