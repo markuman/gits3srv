@@ -167,11 +167,12 @@ git -C x.git push https://git.example.com/foo.git main
 
 - **gc is manual only.** Every push creates a new pack. `POST /foo.git/gc` (rw login) repacks everything into one pack and deletes the old ones from the bucket. Unreachable objects (e.g. deleted branches) are dropped. With Nextcloud the space stays in the trash bin until it is emptied.
 - **One pack = one PUT.** Very large packs fail at the S3 server's upload limit, see [large repos](#large-repos-on-small-hardware).
-- **CAS is only as good as the ETag.** ETags with one-second granularity (Nextcloud) can swallow pushes with multiple instances. A single instance locks via `flock`.
-- **Orphaned packs.** If the CAS fails after the pack upload, the pack stays in the bucket without a ref.
+- **One instance per bucket/prefix.** Only that one locks properly via `flock`. Rolling and blue/green deploys count as two.
+- **CAS is only as good as the ETag.** The ETag has to change with the content (MD5 like AWS, or Nextcloud with s3_api ≥ 1.2.0). One-second ETags (Nextcloud's own) can swallow pushes with two instances.
+- **gc vs. a second instance.** Before deleting old packs, gc rewrites `packed-refs` via CAS with a token in the header (`gits3-gc-<ts>`, git ignores it). A parallel push gets 412 instead of losing its pack. Identical content would not do: the MD5 ETag would stay the same.
+- **Orphaned packs.** If the CAS fails after the pack upload, the pack stays in the bucket without a ref until the next gc.
 - **`receive.fsckObjects`.** Old repos with fsck issues (e.g. `zeroPaddedFilemode`) may not be pushable.
 - **`HEAD`.** Points to `main`. If that branch is missing, gits3 repoints `HEAD` to an existing one on push. If `HEAD` is changed in the bucket from outside, the cache only notices with the next change to `packed-refs`.
-- **gc and ETag granularity.** gc rewrites `packed-refs` with identical content via CAS before deleting old packs. A second instance pushing in parallel then gets 412 and rolls back. ETags with one-second granularity (Nextcloud) can miss this, the same limitation as with pushes.
 - **Slow readers.** A clone holds a shared lock on the repo, a push waits until it finishes.
 - **gc blocks.** gc holds the exclusive lock. Repacking large repos takes minutes, clones and pushes wait meanwhile. Raise `proxy_read_timeout` (nginx) or the equivalent timeout on the reverse proxy accordingly.
 

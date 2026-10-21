@@ -398,6 +398,25 @@ def ref_lines(refs):
     return [l for l in refs.splitlines() if not l.startswith(b"#")]
 
 
+def put_refs(repo, refs, cond):
+    """packed-refs per cas. ein PUT kann serverseitig durch sein, ohne dass die antwort ankommt: der
+    retry in req() bekommt dann 412, oder alle versuche enden in 5xx/netzfehlern. in beiden fällen
+    nachsehen und nur dann werfen, wenn wirklich etwas anderes drin steht."""
+    key = f"{repo}/packed-refs"
+    try:
+        s3.put(key, refs, cond)
+    except (S3Error, OSError) as e:
+        if isinstance(e, S3Error) and e.status != 412 and (e.status or 0) < 500:
+            raise
+        try:
+            st, _, body = s3.get(key)
+        except OSError:
+            raise e  # s3 ganz weg: ausgang unklar, der ursprüngliche fehler zählt
+        if st != 200 or body != refs:
+            raise
+        print(f"gits3: PUT {key} -> {e}, inhalt im bucket ist aber identisch, zählt als erfolg", file=sys.stderr)
+
+
 def push_up(repo, etag, before_refs, before_packs):
     """nach receive-pack: neue packs hoch, dann packed-refs per cas. False, wenn git keine ref
     geändert hat (abgelehnt, no-op), dann geht nichts hoch. wirft S3Error, bei konflikt mit 412."""
@@ -419,7 +438,7 @@ def push_up(repo, etag, before_refs, before_packs):
     else:  # neues repo: erst das gerüst, packed-refs zuletzt. erst damit existiert es
         create_remote(repo)
         cond = {"If-None-Match": "*"}
-    s3.put(f"{repo}/packed-refs", refs, cond)
+    put_refs(repo, refs, cond)
     return True
 
 
@@ -434,14 +453,27 @@ def rollback(repo, before_refs, before_packs):
     set_refs(local, before_refs)
 
 
+def gc_token(refs):
+    """packed-refs mit einem frischen token im header (# pack-refs with: … gits3-gc-<ts>). git ignoriert
+    unbekannte header-tokens, eine eigene kommentarzeile wäre dagegen `unexpected line`. so ändert sich
+    der inhalt und damit auch ein content-etag (md5). der nächste push schreibt den header per pack-refs
+    wieder ohne token."""
+    token = f" gits3-gc-{time.time_ns()} ".encode()  # leerzeichen am ende wie bei git
+    head, sep, rest = refs.partition(b"\n")
+    if head.startswith(b"# pack-refs with:"):
+        return head.rstrip() + token + sep + rest
+    return b"# pack-refs with:" + token + b"\n" + refs  # kein header: git schreibt ihn immer, zur sicherheit
+
+
 def gc(repo, etag):
     """repack -a -d im cache, alle neuen packs hoch, alte packs aus dem bucket weg. nur unter synced(push=True).
     unerreichbare objekte (z.b. gelöschte entwicklungsbranches) fliegen dabei raus.
 
-    reihenfolge: packs hoch, dann packed-refs per cas mit IDENTISCHEM inhalt (ändert nur den etag), erst
-    danach ls + delete. ein paralleler push einer zweiten instanz hat den alten etag: sein cas bekommt 412,
-    er rollt zurück, sein pack bleibt als waise im bucket bis zum nächsten gc. bei 412 bleiben alte packs liegen.
-    sekundengenaue etags (nextcloud) sind dieselbe grenze wie bei pushes."""
+    reihenfolge: packs hoch, dann packed-refs per cas mit GEÄNDERTEM inhalt (token im header, siehe
+    gc_token), erst danach ls + delete. ein paralleler push einer zweiten instanz hat den alten etag: sein
+    cas bekommt 412, er rollt zurück, sein pack bleibt als waise im bucket bis zum nächsten gc. bei 412
+    bleiben alte packs liegen. identischer inhalt reicht nicht: content-etags (md5, wie aws und s3_api)
+    bleiben dann gleich, der fremde push ginge durch und sein pack wäre gleich darauf gelöscht."""
     local = local_dir(repo)
     pdir = os.path.join(local, "objects", "pack")
     prefix = f"{repo}/objects/pack/"
@@ -466,15 +498,16 @@ def gc(repo, etag):
         for ext in (".pack", ".idx"):  # idx nach pack, ls() nimmt nur komplette paare
             with open(os.path.join(pdir, stem + ext), "rb") as f:
                 s3.put(f"{repo}/objects/pack/{stem}{ext}", f)
-    # cas mit identischem inhalt: der etag ändert sich, ein paralleler push mit altem etag bekommt 412.
+    # cas mit geändertem inhalt: der etag ändert sich, ein paralleler push mit altem etag bekommt 412.
     # das passiert vor ls/delete, nicht als GET-vergleich davor (der wäre toctou)
-    refs = read(os.path.join(local, "packed-refs"))
+    refs = gc_token(read(os.path.join(local, "packed-refs")))
     try:
-        s3.put(f"{repo}/packed-refs", refs, {"If-Match": etag})
+        put_refs(repo, refs, {"If-Match": etag})
     except S3Error as e:
         if e.status == 412:
             return f"{repo}: packed-refs hat sich während des gc geändert, alte packs bleiben liegen (nochmal gc)"
         raise
+    # den token nicht in den cache schreiben: _checked ist oben verworfen, der nächste request holt packed-refs ohnehin
     old = [n for n in s3.ls(prefix) if not any(n.startswith(s + ".") for s in packs)]
     old.sort(key=lambda n: not n.endswith(".idx"))  # idx zuerst: ohne idx ist ein pack unsichtbar
     for n in old:
